@@ -1,17 +1,42 @@
 import asyncio
 import json
+import logging
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import boto3
-from fastapi import Depends, FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.auth import require_tenant
 
+logger = logging.getLogger("bedrock_api")
+logger.setLevel(logging.INFO)
+
 app = FastAPI(title="OpenAI Compatible API (Bedrock)")
+
+
+@app.exception_handler(RequestValidationError)
+async def _log_422(request: Request, exc: RequestValidationError) -> JSONResponse:
+    # Logs the offending payload so we can see what unfamiliar clients (e.g. Warp)
+    # actually send when they trip Pydantic. Body is bytes; decode best-effort.
+    body = await request.body()
+    try:
+        body_preview = body.decode("utf-8")
+    except UnicodeDecodeError:
+        body_preview = repr(body[:1024])
+    logger.warning(
+        "422 on %s %s tenant=%s errors=%s body=%s",
+        request.method,
+        request.url.path,
+        getattr(request.state, "tenant_id", None),
+        json.dumps(exc.errors(), default=str),
+        body_preview,
+    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 MODEL_ID: Optional[str] = os.environ.get("BEDROCK_MODEL_ID")
 AWS_REGION: Optional[str] = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
