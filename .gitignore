@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Node / CDK
+infra/node_modules/
+infra/cdk.out/
+infra/.cdk.staging/
+
+# Local env
+.env
+.env.local
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# MemPalace per-project files (issue #185)
+mempalace.yaml
+entities.json

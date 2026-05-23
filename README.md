@@ -1,69 +1,157 @@
-# OpenAI-Compatible API Layer
+# OpenAI-Compatible API for AWS Bedrock
 
-This project provides an OpenAI-compatible API layer that can wrap custom LLM APIs. It implements the same interface as OpenAI's API, making it easy to use existing OpenAI client libraries with your custom LLM implementation.
+A drop-in OpenAI-compatible HTTP layer in front of AWS Bedrock. Point any OpenAI SDK at it and it routes chat completions through Bedrock's `Converse` / `ConverseStream` API. Multi-tenant via API keys stored in AWS Secrets Manager.
 
 ## Features
 
-- Full OpenAI API compatibility for text-based endpoints
-- Support for both streaming and non-streaming responses
-- Chat completions endpoint (`/v1/chat/completions`)
-- Text completions endpoint (`/v1/completions`)
-- Models endpoint (`/v1/models`)
-- Built with FastAPI for high performance and automatic API documentation
+- `/v1/chat/completions` — non-streaming and SSE streaming, OpenAI-shaped requests/responses
+- `/v1/completions` — legacy text completions (translated to chat under the hood)
+- `/v1/models` — returns the configured Bedrock model id
+- Multi-tenant API keys (`Authorization: Bearer <key>`) sourced from a single Secrets Manager secret, cached in-process
+- Real token usage from Bedrock (`prompt_tokens` / `completion_tokens` / `total_tokens`)
+- `finish_reason` mapped from Bedrock stop reasons (`end_turn`, `max_tokens`, `tool_use`, content/guardrail filters)
+- Production-ready async streaming — boto3's sync iterator is offloaded to threads, so the event loop stays responsive and shutdown is prompt
+- ARM64/Graviton container, deployed via AWS CDK to ECS Fargate behind ALB + CloudFront
 
-## Installation
+## Quick start (local)
 
 ```bash
+python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Running the Server
+Set the required env vars and run:
 
 ```bash
-./run.sh
+export BEDROCK_MODEL_ID=au.anthropic.claude-opus-4-6-v1   # or any inference profile / model ID
+export TENANT_KEYS_SECRET_ID=bedrock-api/tenant-keys      # JSON {"tenant": "key"} in Secrets Manager
+export AWS_REGION=ap-southeast-2
+# AWS credentials must be in env (env vars, profile, instance role, etc.)
+
+./run.sh "$BEDROCK_MODEL_ID"
 ```
 
-The server will start on `http://localhost:8000` with automatic reload enabled.
+Press **Ctrl+G** to quit (Ctrl+C is intentionally remapped — see `run.sh`). To enable autoreload during development: `RELOAD=1 ./run.sh "$BEDROCK_MODEL_ID"`.
 
-## API Documentation
+> **Note**: Claude 4-family models on Bedrock require a cross-region inference profile (`au.`, `us.`, `eu.`, `apac.`, or `global.` prefix), not the raw model ID. Use `aws bedrock list-inference-profiles --region <region>` to discover available profiles.
 
-Once the server is running, you can access:
-- Swagger UI documentation at `/docs`
-- ReDoc documentation at `/redoc`
+## Configuration
 
-## Integration
+| Env var                    | Required | Default | Notes                                                     |
+|----------------------------|----------|---------|-----------------------------------------------------------|
+| `BEDROCK_MODEL_ID`         | yes      | —       | Bedrock model id or inference profile id                  |
+| `TENANT_KEYS_SECRET_ID`    | yes      | —       | Secrets Manager secret name/ARN (JSON map)                |
+| `AWS_REGION`               | yes      | —       | Bedrock + Secrets Manager region                          |
+| `TENANT_KEYS_CACHE_TTL`    | no       | `300`   | Seconds to cache the tenant key map                       |
+| `WEB_CONCURRENCY`          | no       | `2`     | uvicorn worker count (container only)                     |
 
-To use this API with OpenAI client libraries, simply point them to your server:
+The tenant keys secret holds a JSON object mapping tenant id to API key:
+
+```json
+{
+  "acme": "sk-acme-very-secret",
+  "globex": "sk-globex-very-secret"
+}
+```
+
+Rotate keys without redeploying:
+
+```bash
+aws secretsmanager put-secret-value \
+  --secret-id bedrock-api/tenant-keys \
+  --secret-string '{"acme":"sk-new-key","globex":"sk-globex-very-secret"}'
+```
+
+New values take effect within `TENANT_KEYS_CACHE_TTL` seconds.
+
+## Using it from an OpenAI client
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="dummy"  # API key can be any string as we're not using it
+    base_url="https://<your-cloudfront-domain>/v1",
+    api_key="sk-acme-very-secret",  # one of the keys from the secret
 )
 
-# Chat completion example
-response = client.chat.completions.create(
-    model="your-model",
-    messages=[{"role": "user", "content": "Hello!"}]
-)
-
-# Streaming example
-for chunk in client.chat.completions.create(
-    model="your-model",
+resp = client.chat.completions.create(
+    model="anything",  # ignored — server uses BEDROCK_MODEL_ID
     messages=[{"role": "user", "content": "Hello!"}],
-    stream=True
+)
+print(resp.choices[0].message.content)
+
+for chunk in client.chat.completions.create(
+    model="anything",
+    messages=[{"role": "user", "content": "Stream me a haiku."}],
+    stream=True,
 ):
-    print(chunk.choices[0].delta.content or "", end="")
+    print(chunk.choices[0].delta.content or "", end="", flush=True)
 ```
 
-## Implementation Notes
+The `model` field on the request is ignored — the server uses whatever `BEDROCK_MODEL_ID` it was started with. `/v1/models` returns that single configured model.
 
-To integrate your custom LLM API:
+### curl
 
-1. Implement the `call_llm_api` function in `app/main.py` for non-streaming responses
-2. Implement the `stream_llm_api` function for streaming responses
-3. Add proper token counting in the Usage model
-4. Update the models list in the `/v1/models` endpoint
-5. Add any additional error handling specific to your API
+```bash
+DOMAIN=<your-host-or-cloudfront-domain>
+KEY=sk-acme-very-secret
+
+# Models
+curl -sS "https://$DOMAIN/v1/models" -H "Authorization: Bearer $KEY"
+
+# Non-streaming chat
+curl -sS "https://$DOMAIN/v1/chat/completions" \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Say hi in 5 words"}],"model":"x"}'
+
+# Streaming
+curl -N "https://$DOMAIN/v1/chat/completions" \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Count to 5"}],"model":"x","stream":true}'
+```
+
+## Tests
+
+```bash
+. .venv/bin/activate && python -m pytest tests/ -v
+```
+
+12 tests cover OpenAI ↔ Bedrock translation (system message split, content blocks, finish_reason mapping, streaming SSE) and auth (missing/invalid/valid key, /v1/models gating, key cache, missing secret env).
+
+## API docs
+
+When the server is running locally, FastAPI serves:
+- Swagger UI at `/docs`
+- ReDoc at `/redoc`
+
+(Both endpoints are unauthenticated — they only describe the schema.)
+
+## Deployment
+
+Deployment to AWS (ECS Fargate ARM64 + ALB + CloudFront, multi-tenant Secrets Manager, GitHub Actions OIDC) is fully scripted in `infra/` (CDK TypeScript) and `.github/workflows/`.
+
+See [DEPLOYMENT.md](./DEPLOYMENT.md) for the one-time bootstrap, GitHub secret config, and rollout steps.
+
+## Project structure
+
+```
+app/
+  main.py            FastAPI routes, Bedrock translation, async streaming
+  auth.py            Bearer auth + tenant key map cached from Secrets Manager
+tests/
+  conftest.py        Shared fixtures (app reload, fake bedrock, fake secrets, client)
+  test_main.py       Routing + Bedrock translation
+  test_auth.py       Auth + tenant identification
+infra/               CDK: OidcStack (GitHub OIDC role) + BedrockApiStack
+.github/workflows/   test.yml + deploy.yml (OIDC, buildx ARM64, ECR, cdk deploy)
+Dockerfile           python:3.12-slim, tini, non-root, multi-arch base
+run.sh               ./run.sh <model-id> [host] [port] — Ctrl+G to quit
+DEPLOYMENT.md        AWS bootstrap + rollout
+CLAUDE.md            Conventions for AI agents working in this repo
+```
+
+## License
+
+MIT (or whatever you choose — set the LICENSE file).

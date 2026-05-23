@@ -1,0 +1,16 @@
+.git
+.github
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+tests
+infra
+cdk.out
+node_modules
+.env
+.env.*
+*.md
+LINKING.md
+README.md
+run.sh

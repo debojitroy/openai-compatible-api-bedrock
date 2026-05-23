@@ -1,0 +1,89 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-southeast-2
+  ECR_REPO: bedrock-api
+
+jobs:
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build-and-deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      GH_ORG: ${{ github.repository_owner }}
+      GH_REPO: ${{ github.event.repository.name }}
+      IMAGE_TAG: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up QEMU (ARM64 cross-build)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ARM64 image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/arm64
+          push: true
+          provenance: false
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ env.IMAGE_TAG }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: infra/package-lock.json
+
+      - name: Install CDK deps
+        run: npm ci
+        working-directory: infra
+
+      - name: CDK deploy
+        working-directory: infra
+        run: |
+          npx cdk deploy BedrockApi \
+            --require-approval never \
+            --context githubOrg="$GH_ORG" \
+            --context githubRepo="$GH_REPO"
+
+      - name: Force ECS service to pull new image
+        run: |
+          CLUSTER=$(aws cloudformation describe-stacks --stack-name BedrockApi --query "Stacks[0].Outputs[?OutputKey=='EcsClusterName'].OutputValue" --output text)
+          SERVICE=$(aws cloudformation describe-stacks --stack-name BedrockApi --query "Stacks[0].Outputs[?OutputKey=='EcsServiceName'].OutputValue" --output text)
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" --force-new-deployment >/dev/null
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
