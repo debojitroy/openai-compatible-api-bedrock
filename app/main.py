@@ -56,7 +56,10 @@ def _get_client() -> Any:
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    # Some clients (e.g. Warp) send content as a list of parts:
+    # [{"type": "text", "text": "..."}]. Some send None alongside tool_calls.
+    # We accept all three shapes; _extract_text normalizes to a string.
+    content: Optional[Union[str, List[Dict[str, Any]]]] = None
     name: Optional[str] = None
 
 
@@ -142,6 +145,25 @@ def _require_model_id() -> str:
     return MODEL_ID
 
 
+def _normalize_content_text(content: Optional[Union[str, List[Dict[str, Any]]]]) -> str:
+    """Normalize OpenAI request message content to a flat string.
+
+    Accepts: str, list of content parts (e.g. [{"type":"text","text":"..."}]),
+    or None. Non-text parts (images, etc.) are ignored.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts: List[str] = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "text":
+            text = part.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
+
+
 def _to_bedrock_messages(
     messages: List[ChatMessage],
 ) -> Tuple[List[Dict[str, str]], List[Dict[str, Any]]]:
@@ -149,11 +171,13 @@ def _to_bedrock_messages(
     system_blocks: List[Dict[str, str]] = []
     bedrock_messages: List[Dict[str, Any]] = []
     for m in messages:
+        text = _normalize_content_text(m.content)
         if m.role == "system":
-            system_blocks.append({"text": m.content})
+            if text:
+                system_blocks.append({"text": text})
             continue
         role = m.role if m.role in ("user", "assistant") else "user"
-        bedrock_messages.append({"role": role, "content": [{"text": m.content}]})
+        bedrock_messages.append({"role": role, "content": [{"text": text}]})
     return system_blocks, bedrock_messages
 
 

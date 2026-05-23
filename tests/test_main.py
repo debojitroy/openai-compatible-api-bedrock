@@ -86,6 +86,35 @@ def test_finish_reason_max_tokens_maps_to_length(client, fake_bedrock, auth_head
     assert resp.json()["choices"][0]["finish_reason"] == "length"
 
 
+def test_content_as_list_of_text_parts_is_flattened(client, fake_bedrock, auth_headers):
+    """Warp/newer OpenAI SDKs send content as [{"type":"text","text":"..."}]."""
+    fake_bedrock.converse.return_value = {
+        "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
+        "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+        "stopReason": "end_turn",
+    }
+    resp = client.post(
+        "/v1/chat/completions",
+        headers=auth_headers,
+        json={
+            "model": "x",
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": "be terse"}]},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hello "},
+                    {"type": "text", "text": "world"},
+                ]},
+            ],
+        },
+    )
+    assert resp.status_code == 200
+    kwargs = fake_bedrock.converse.call_args.kwargs
+    assert kwargs["system"] == [{"text": "be terse"}]
+    assert kwargs["messages"] == [
+        {"role": "user", "content": [{"text": "hello world"}]}
+    ]
+
+
 def test_assistant_messages_are_passed_as_assistant_role(client, fake_bedrock, auth_headers):
     fake_bedrock.converse.return_value = {
         "output": {"message": {"role": "assistant", "content": [{"text": "ok"}]}},
