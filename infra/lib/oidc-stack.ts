@@ -93,6 +93,25 @@ export class OidcStack extends cdk.Stack {
       ],
     }));
 
+    // Post-deploy: read CFN outputs (cluster + service names) and force a new
+    // ECS deployment so tasks pull the freshly pushed :latest image.
+    this.deployRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['cloudformation:DescribeStacks'],
+      resources: [
+        `arn:aws:cloudformation:${this.region}:${this.account}:stack/BedrockApi/*`,
+      ],
+    }));
+    this.deployRole.addToPolicy(new iam.PolicyStatement({
+      actions: [
+        'ecs:UpdateService',
+        'ecs:DescribeServices',
+      ],
+      // Service ARN isn't known until BedrockApi is deployed; scope by region+account.
+      resources: [
+        `arn:aws:ecs:${this.region}:${this.account}:service/*/*`,
+      ],
+    }));
+
     new cdk.CfnOutput(this, 'DeployRoleArn', {
       value: this.deployRole.roleArn,
       description: 'Set this as the AWS_ROLE_TO_ASSUME secret in GitHub Actions.',
